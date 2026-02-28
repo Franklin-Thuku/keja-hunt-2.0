@@ -1,0 +1,27 @@
+{
+  "name": "keja-hunt",
+  "version": "2.0.0",
+  "description": "House hunting platform for customers and landlords",
+  "main": "server/index.js",
+  "scripts": {
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "server": "cd server && nodemon index.js",
+    "client": "cd client && npm start",
+    "install-all": "npm install && cd server && npm install && cd ../client && npm install"
+  },
+  "keywords": [
+    "house-hunting",
+    "real-estate",
+    "rental"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "nodemon": "^3.1.11"
+  },
+  "dependencies": {
+    "all": "^0.0.0",
+    "multer": "^2.0.2"
+  }
+}
