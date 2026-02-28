@@ -94,23 +94,103 @@ router.post('/', auth, isLandlord, async (req, res) => {
 // 5. UPLOAD IMAGES
 router.post('/:id/images', auth, isLandlord, upload.array('images', 10), async (req, res) => {
   try {
-    const { data: house, error: fetchError } = await supabase.from('houses').select('images, landlord_id').eq('id', req.params.id).single();
-    if (fetchError || house.landlord_id !== req.user.id) return res.status(403).json({ message: 'Unauthorized' });
+    if (!req.files || req.files.length === 0) return res.status(400).json({ message: 'No images uploaded' });
+
+    // 1. Log the attempt
+    console.log(`Uploading images for house: ${req.params.id}`);
 
     const uploadedUrls = [];
     for (const file of req.files) {
-      const filePath = `house-${req.params.id}/${Date.now()}-${file.originalname}`;
-      const { error: uploadError } = await supabase.storage.from('house-images').upload(filePath, file.buffer, { contentType: file.mimetype });
-      if (uploadError) throw uploadError;
-      uploadedUrls.push(supabase.storage.from('house-images').getPublicUrl(filePath).data.publicUrl);
+      const fileName = `${Date.now()}-${file.originalname}`;
+      const filePath = `house-${req.params.id}/${fileName}`;
+
+      const { data, error: uploadError } = await supabase.storage
+        .from('house-images')
+        .upload(filePath, file.buffer, { 
+          contentType: file.mimetype,
+          upsert: true // This prevents "Already exists" errors
+        });
+
+      if (uploadError) {
+        console.error("SUPABASE UPLOAD ERROR:", uploadError); // LOOK FOR THIS IN TERMINAL
+        throw uploadError;
+      }
+
+      const { data: publicUrlData } = supabase.storage.from('house-images').getPublicUrl(filePath);
+      uploadedUrls.push(publicUrlData.publicUrl);
     }
 
-    const { data: updated, error: updateError } = await supabase.from('houses').update({ images: [...(house.images || []), ...uploadedUrls] }).eq('id', req.params.id).select().single();
-    if (updateError) throw updateError;
-    res.json(updated);
+    // 2. Update the database with new image URLs
+    const { data: house, error: fetchError } = await supabase
+      .from('houses')
+      .select('images')
+      .eq('id', req.params.id)
+      .single();
+
+    const updatedImages = [...(house?.images || []), ...uploadedUrls];
+
+    const { error: updateError } = await supabase
+      .from('houses')
+      .update({ images: updatedImages })
+      .eq('id', req.params.id);
+
+    if (updateError) {
+      console.error("DATABASE UPDATE ERROR:", updateError);
+      throw updateError;
+    }
+
+    res.json({ images: updatedImages });
   } catch (error) {
+    console.error("FINAL CATCH ERROR:", error.message);
     res.status(500).json({ message: error.message });
   }
 });
 
+
+/**
+ * @route   DELETE /api/houses/:id
+ * @desc    Delete a house listing (Landlord only)
+ */
+router.delete('/:id', auth, isLandlord, async (req, res) => {
+  try {
+    // 1. First, check if the house exists and belongs to this landlord
+    const { data: house, error: fetchError } = await supabase
+      .from('houses')
+      .select('landlord_id, images')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchError || !house) {
+      return res.status(404).json({ message: 'House not found' });
+    }
+
+    if (house.landlord_id !== req.user.id) {
+      return res.status(403).json({ message: 'Unauthorized: You can only delete your own listings' });
+    }
+
+    // 2. Optional: Delete associated images from Supabase Storage first
+    if (house.images && house.images.length > 0) {
+      for (const imageUrl of house.images) {
+        // Extract the file path from the public URL
+        const filePath = imageUrl.split('/house-images/')[1];
+        if (filePath) {
+          await supabase.storage.from('house-images').remove([filePath]);
+        }
+      }
+    }
+
+    // 3. Delete the record from the database
+    const { error: deleteError } = await supabase
+      .from('houses')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (deleteError) throw deleteError;
+
+    res.json({ message: 'Property deleted successfully' });
+  } catch (error) {
+    console.error('Delete Error:', error.message);
+    res.status(500).json({ message: error.message });
+  }
+});
 module.exports = router;
