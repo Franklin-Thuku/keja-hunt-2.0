@@ -1,5 +1,5 @@
 const express = require('express');
-const User = require('../models/User');
+const supabase = require('../supabaseClient');
 const { auth } = require('../middleware/auth');
 
 const router = express.Router();
@@ -7,7 +7,13 @@ const router = express.Router();
 // Get user profile
 router.get('/profile', auth, async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).select('-password');
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('id, name, email, role, phone') // Explicitly select to exclude password
+      .eq('id', req.user.id)
+      .single();
+
+    if (error || !user) return res.status(404).json({ message: 'User not found' });
     res.json(user);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -18,23 +24,23 @@ router.get('/profile', auth, async (req, res) => {
 router.put('/profile', auth, async (req, res) => {
   try {
     const { name, phone } = req.body;
-    const user = await User.findById(req.user._id);
+    
+    const updates = {};
+    if (name) updates.name = name;
+    if (phone) updates.phone = phone;
 
-    if (name) user.name = name;
-    if (phone) user.phone = phone;
+    const { data: user, error } = await supabase
+      .from('users')
+      .update(updates)
+      .eq('id', req.user.id)
+      .select('id, name, email, role, phone')
+      .single();
 
-    await user.save();
-    res.json({
-      id: user._id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      phone: user.phone
-    });
+    if (error) throw error;
+    res.json(user);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
 module.exports = router;
-

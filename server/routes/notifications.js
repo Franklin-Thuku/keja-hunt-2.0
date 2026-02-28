@@ -1,17 +1,23 @@
 const express = require('express');
 const router = express.Router();
-const Notification = require('../models/Notification');
+const supabase = require('../supabaseClient');
 const { auth } = require('../middleware/auth');
 
 // Get all notifications for a user
 router.get('/', auth, async (req, res) => {
   try {
-    const notifications = await Notification.find({ recipient: req.user.id })
-      .populate('sender', 'name email')
-      .populate('relatedHouse', 'title')
-      .sort({ createdAt: -1 })
+    const { data: notifications, error } = await supabase
+      .from('notifications')
+      .select(`
+        *,
+        sender:users(name, email),
+        relatedHouse:houses(title)
+      `)
+      .eq('recipient_id', req.user.id)
+      .order('created_at', { ascending: false })
       .limit(50);
     
+    if (error) throw error;
     res.json(notifications);
   } catch (error) {
     console.error('Error fetching notifications:', error);
@@ -22,11 +28,13 @@ router.get('/', auth, async (req, res) => {
 // Get unread notifications count
 router.get('/unread-count', auth, async (req, res) => {
   try {
-    const count = await Notification.countDocuments({ 
-      recipient: req.user.id, 
-      read: false 
-    });
+    const { count, error } = await supabase
+      .from('notifications')
+      .select('*', { count: 'exact', head: true })
+      .eq('recipient_id', req.user.id)
+      .eq('read', false);
     
+    if (error) throw error;
     res.json({ count });
   } catch (error) {
     console.error('Error fetching unread count:', error);
@@ -37,13 +45,15 @@ router.get('/unread-count', auth, async (req, res) => {
 // Mark notification as read
 router.put('/:id/read', auth, async (req, res) => {
   try {
-    const notification = await Notification.findOneAndUpdate(
-      { _id: req.params.id, recipient: req.user.id },
-      { read: true },
-      { new: true }
-    );
+    const { data: notification, error } = await supabase
+      .from('notifications')
+      .update({ read: true })
+      .eq('id', req.params.id)
+      .eq('recipient_id', req.user.id)
+      .select()
+      .single();
     
-    if (!notification) {
+    if (error || !notification) {
       return res.status(404).json({ message: 'Notification not found' });
     }
     
@@ -57,11 +67,13 @@ router.put('/:id/read', auth, async (req, res) => {
 // Mark all notifications as read
 router.put('/mark-all-read', auth, async (req, res) => {
   try {
-    await Notification.updateMany(
-      { recipient: req.user.id, read: false },
-      { read: true }
-    );
+    const { error } = await supabase
+      .from('notifications')
+      .update({ read: true })
+      .eq('recipient_id', req.user.id)
+      .eq('read', false);
     
+    if (error) throw error;
     res.json({ message: 'All notifications marked as read' });
   } catch (error) {
     console.error('Error marking all notifications as read:', error);
@@ -72,15 +84,13 @@ router.put('/mark-all-read', auth, async (req, res) => {
 // Delete notification
 router.delete('/:id', auth, async (req, res) => {
   try {
-    const notification = await Notification.findOneAndDelete({
-      _id: req.params.id,
-      recipient: req.user.id
-    });
+    const { error } = await supabase
+      .from('notifications')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('recipient_id', req.user.id);
     
-    if (!notification) {
-      return res.status(404).json({ message: 'Notification not found' });
-    }
-    
+    if (error) throw error;
     res.json({ message: 'Notification deleted' });
   } catch (error) {
     console.error('Error deleting notification:', error);
@@ -89,17 +99,21 @@ router.delete('/:id', auth, async (req, res) => {
 });
 
 // Create notification (internal function)
-const createNotification = async (recipient, type, title, message, relatedData = {}) => {
+const createNotification = async (recipient_id, type, title, message, relatedData = {}) => {
   try {
-    const notification = new Notification({
-      recipient,
-      type,
-      title,
-      message,
-      ...relatedData
-    });
+    const { data: notification, error } = await supabase
+      .from('notifications')
+      .insert([{
+        recipient_id,
+        type,
+        title,
+        message,
+        ...relatedData
+      }])
+      .select()
+      .single();
     
-    await notification.save();
+    if (error) throw error;
     return notification;
   } catch (error) {
     console.error('Error creating notification:', error);

@@ -1,5 +1,5 @@
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const supabase = require('../supabaseClient');
 
 const auth = async (req, res, next) => {
   try {
@@ -10,9 +10,15 @@ const auth = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
-    const user = await User.findById(decoded.userId).select('-password');
     
-    if (!user) {
+    // Fetch user from Supabase, explicitly selecting fields to exclude the password
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('id, name, email, phone, role')
+      .eq('id', decoded.userId)
+      .single();
+    
+    if (error || !user) {
       return res.status(401).json({ message: 'Token is not valid' });
     }
 
@@ -31,4 +37,3 @@ const isLandlord = (req, res, next) => {
 };
 
 module.exports = { auth, isLandlord };
-

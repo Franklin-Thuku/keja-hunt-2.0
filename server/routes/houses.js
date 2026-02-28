@@ -1,80 +1,42 @@
 const express = require('express');
-const House = require('../models/House');
+const supabase = require('../supabaseClient');
 const { auth, isLandlord } = require('../middleware/auth');
 const upload = require('../middleware/upload');
-const path = require('path');
 
 const router = express.Router();
 
-// Get all houses with filters
+/**
+ * @route   GET /api/houses
+ * @desc    Get all houses with filters
+ */
 router.get('/', async (req, res) => {
   try {
-    const {
-      location,
-      city,
-      state,
-      minPrice,
-      maxPrice,
-      minBedrooms,
-      maxBedrooms,
-      propertyType,
-      available,
-      search
-    } = req.query;
+    const { location, city, state, minPrice, maxPrice, minBedrooms, propertyType, available, search } = req.query;
 
-    // Build filter object
-    const filter = {};
+    let query = supabase
+      .from('houses')
+      .select('*, users!houses_landlord_id_fkey(name, email, phone)')
+      .order('created_at', { ascending: false });
 
-    if (available !== undefined) {
-      filter.available = available === 'true';
-    } else {
-      filter.available = true; // Default to show only available houses
-    }
-
-    if (city) {
-      filter['location.city'] = new RegExp(city, 'i');
-    }
-
-    if (state) {
-      filter['location.state'] = new RegExp(state, 'i');
-    }
+    // Filter logic
+    if (available !== undefined) query = query.eq('available', available !== 'false');
+    if (city) query = query.ilike('city', `%${city}%`);
+    if (state) query = query.ilike('state', `%${state}%`);
+    if (propertyType) query = query.eq('property_type', propertyType);
+    if (minPrice) query = query.gte('price', Number(minPrice));
+    if (maxPrice) query = query.lte('price', Number(maxPrice));
+    if (minBedrooms) query = query.gte('bedrooms', Number(minBedrooms));
 
     if (location) {
-      filter.$or = [
-        { 'location.address': new RegExp(location, 'i') },
-        { 'location.city': new RegExp(location, 'i') },
-        { 'location.state': new RegExp(location, 'i') }
-      ];
-    }
-
-    if (minPrice || maxPrice) {
-      filter.price = {};
-      if (minPrice) filter.price.$gte = Number(minPrice);
-      if (maxPrice) filter.price.$lte = Number(maxPrice);
-    }
-
-    if (minBedrooms || maxBedrooms) {
-      filter.bedrooms = {};
-      if (minBedrooms) filter.bedrooms.$gte = Number(minBedrooms);
-      if (maxBedrooms) filter.bedrooms.$lte = Number(maxBedrooms);
-    }
-
-    if (propertyType) {
-      filter.propertyType = propertyType;
+      query = query.or(`address.ilike.%${location}%,city.ilike.%${location}%,state.ilike.%${location}%`);
     }
 
     if (search) {
-      filter.$or = [
-        { title: new RegExp(search, 'i') },
-        { description: new RegExp(search, 'i') },
-        { 'location.address': new RegExp(search, 'i') },
-        { 'location.city': new RegExp(search, 'i') }
-      ];
+      query = query.or(`title.ilike.%${search}%,description.ilike.%${search}%,address.ilike.%${search}%`);
     }
 
-    const houses = await House.find(filter)
-      .populate('landlord', 'name email phone')
-      .sort({ createdAt: -1 });
+    const { data: houses, error } = await query;
+    if (error) throw error;
 
     res.json(houses);
   } catch (error) {
@@ -82,155 +44,123 @@ router.get('/', async (req, res) => {
   }
 });
 
-// Get single house
-router.get('/:id', async (req, res) => {
-  try {
-    const house = await House.findById(req.params.id)
-      .populate('landlord', 'name email phone');
-    
-    if (!house) {
-      return res.status(404).json({ message: 'House not found' });
-    }
-
-    res.json(house);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
-
-// Create house (landlord only)
+/**
+ * @route   POST /api/houses
+ * @desc    Create a new house listing
+ */
 router.post('/', auth, isLandlord, async (req, res) => {
   try {
+    const { 
+      title, description, price, bedrooms, bathrooms, 
+      area, propertyType, location, amenities, available 
+    } = req.body;
+
+    // Map the nested frontend data to flat database columns
     const houseData = {
-      ...req.body,
-      landlord: req.user._id
+      title,
+      description,
+      price: Number(price),
+      bedrooms: Number(bedrooms),
+      bathrooms: Number(bathrooms),
+      area: Number(area),
+      property_type: propertyType, // Maps 'propertyType' to 'property_type'
+      address: location?.address,  // Flattens location object
+      city: location?.city,        
+      state: location?.state,      
+      amenities: Array.isArray(amenities) ? amenities : [],
+      available: available ?? true,
+      landlord_id: req.user.id
     };
 
-    const house = new House(houseData);
-    await house.save();
-    await house.populate('landlord', 'name email phone');
+    const { data: house, error } = await supabase
+      .from('houses')
+      .insert([houseData])
+      .select('*, users!houses_landlord_id_fkey(name, email, phone)')
+      .single();
 
+    if (error) throw error;
     res.status(201).json(house);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-// Update house (landlord only, own houses)
+/**
+ * @route   PUT /api/houses/:id
+ * @desc    Update house details (Landlord only)
+ */
 router.put('/:id', auth, isLandlord, async (req, res) => {
   try {
-    const house = await House.findById(req.params.id);
+    // 1. Verify ownership
+    const { data: house, error: fetchError } = await supabase
+      .from('houses')
+      .select('landlord_id')
+      .eq('id', req.params.id)
+      .single();
 
-    if (!house) {
-      return res.status(404).json({ message: 'House not found' });
-    }
+    if (fetchError || !house) return res.status(404).json({ message: 'House not found' });
+    if (house.landlord_id !== req.user.id) return res.status(403).json({ message: 'Unauthorized' });
 
-    // Check if user owns this house
-    if (house.landlord.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not authorized to update this house' });
-    }
+    // 2. Perform update with sanitized data
+    const { data: updatedHouse, error: updateError } = await supabase
+      .from('houses')
+      .update(req.body)
+      .eq('id', req.params.id)
+      .select('*, users!houses_landlord_id_fkey(name, email, phone)')
+      .single();
 
-    Object.assign(house, req.body);
-    await house.save();
-    await house.populate('landlord', 'name email phone');
-
-    res.json(house);
+    if (updateError) throw updateError;
+    res.json(updatedHouse);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-// Delete house (landlord only, own houses)
-router.delete('/:id', auth, isLandlord, async (req, res) => {
-  try {
-    const house = await House.findById(req.params.id);
-
-    if (!house) {
-      return res.status(404).json({ message: 'House not found' });
-    }
-
-    // Check if user owns this house
-    if (house.landlord.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not authorized to delete this house' });
-    }
-
-    await house.deleteOne();
-    res.json({ message: 'House deleted successfully' });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
-
-// Get landlord's houses
-router.get('/landlord/my-houses', auth, isLandlord, async (req, res) => {
-  try {
-    const houses = await House.find({ landlord: req.user._id })
-      .populate('landlord', 'name email phone')
-      .sort({ createdAt: -1 });
-
-    res.json(houses);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
-
-// Upload images for a house (landlord only)
+/**
+ * @route   POST /api/houses/:id/images
+ * @desc    Upload images to Supabase Storage
+ */
 router.post('/:id/images', auth, isLandlord, upload.array('images', 10), async (req, res) => {
   try {
-    const house = await House.findById(req.params.id);
+    if (!req.files || req.files.length === 0) return res.status(400).json({ message: 'No images uploaded' });
 
-    if (!house) {
-      return res.status(404).json({ message: 'House not found' });
+    const { data: house, error: fetchError } = await supabase
+      .from('houses')
+      .select('landlord_id, images')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchError || house.landlord_id !== req.user.id) return res.status(403).json({ message: 'Unauthorized' });
+
+    const uploadedUrls = [];
+    for (const file of req.files) {
+      const fileName = `${Date.now()}-${file.originalname}`;
+      const filePath = `house-${req.params.id}/${fileName}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from('house-images')
+        .upload(filePath, file.buffer, { contentType: file.mimetype });
+
+      if (uploadError) throw uploadError;
+
+      const { data: publicUrlData } = supabase.storage.from('house-images').getPublicUrl(filePath);
+      uploadedUrls.push(publicUrlData.publicUrl);
     }
 
-    // Check if user owns this house
-    if (house.landlord.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not authorized to upload images for this house' });
-    }
+    const updatedImages = [...(house.images || []), ...uploadedUrls];
+    const { data: finalHouse, error: updateError } = await supabase
+      .from('houses')
+      .update({ images: updatedImages })
+      .eq('id', req.params.id)
+      .select('images')
+      .single();
 
-    if (!req.files || req.files.length === 0) {
-      return res.status(400).json({ message: 'No images uploaded' });
-    }
-
-    // Add image paths to house
-    const imagePaths = req.files.map(file => `/uploads/${file.filename}`);
-    house.images = [...(house.images || []), ...imagePaths];
-    await house.save();
-
-    res.json({ images: house.images });
+    if (updateError) throw updateError;
+    res.json({ images: finalHouse.images });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-// Delete an image from a house (landlord only)
-router.delete('/:id/images/:imageIndex', auth, isLandlord, async (req, res) => {
-  try {
-    const house = await House.findById(req.params.id);
-
-    if (!house) {
-      return res.status(404).json({ message: 'House not found' });
-    }
-
-    // Check if user owns this house
-    if (house.landlord.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not authorized' });
-    }
-
-    const imageIndex = parseInt(req.params.imageIndex);
-    if (imageIndex < 0 || imageIndex >= house.images.length) {
-      return res.status(400).json({ message: 'Invalid image index' });
-    }
-
-    // Remove image from array
-    house.images.splice(imageIndex, 1);
-    await house.save();
-
-    res.json({ images: house.images });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
-
+// Export the router
 module.exports = router;
-

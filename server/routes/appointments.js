@@ -1,9 +1,23 @@
 const express = require('express');
-const Appointment = require('../models/Appointment');
-const House = require('../models/House');
+const supabase = require('../supabaseClient');
 const { auth } = require('../middleware/auth');
 
 const router = express.Router();
+
+// Helper to get appointment with all joined data
+const getFullAppointment = async (id) => {
+  const { data, error } = await supabase
+    .from('appointments')
+    .select(`
+      *,
+      house:houses(title, location, price, images),
+      customer:users!appointment_customer_id_fkey(name, email, phone),
+      landlord:users!appointment_landlord_id_fkey(name, email, phone)
+    `)
+    .eq('id', id)
+    .single();
+  return { data, error };
+};
 
 // Create appointment (customer only)
 router.post('/', auth, async (req, res) => {
@@ -14,42 +28,58 @@ router.post('/', auth, async (req, res) => {
       return res.status(403).json({ message: 'Only customers can book appointments' });
     }
 
-    const house = await House.findById(houseId);
-    if (!house) {
+    // Check if house exists and get landlord_id
+    const { data: house, error: houseError } = await supabase
+      .from('houses')
+      .select('landlord_id')
+      .eq('id', houseId)
+      .single();
+
+    if (houseError || !house) {
       return res.status(404).json({ message: 'House not found' });
     }
 
-    const appointment = new Appointment({
-      house: houseId,
-      customer: req.user._id,
-      landlord: house.landlord,
-      appointmentDate,
-      appointmentTime,
-      message: message || ''
-    });
+    const { data: appointment, error: insertError } = await supabase
+      .from('appointments')
+      .insert([{
+        house_id: houseId,
+        customer_id: req.user.id,
+        landlord_id: house.landlord_id,
+        appointment_date: appointmentDate,
+        appointment_time: appointmentTime,
+        message: message || '',
+        status: 'pending'
+      }])
+      .select()
+      .single();
 
-    await appointment.save();
-    await appointment.populate('house', 'title location');
-    await appointment.populate('customer', 'name email phone');
-    await appointment.populate('landlord', 'name email phone');
+    if (insertError) throw insertError;
 
-    res.status(201).json(appointment);
+    // Fetch with populated details
+    const { data: fullAppointment } = await getFullAppointment(appointment.id);
+    res.status(201).json(fullAppointment);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ message: error.message, error: error.details });
   }
 });
 
 // Get customer's appointments
 router.get('/customer/my-appointments', auth, async (req, res) => {
   try {
-    const appointments = await Appointment.find({ customer: req.user._id })
-      .populate('house', 'title location price images')
-      .populate('landlord', 'name email phone')
-      .sort({ appointmentDate: -1 });
+    const { data: appointments, error } = await supabase
+      .from('appointments')
+      .select(`
+        *,
+        house:houses(title, location, price, images),
+        landlord:users!appointment_landlord_id_fkey(name, email, phone)
+      `)
+      .eq('customer_id', req.user.id)
+      .order('appointment_date', { ascending: false });
 
+    if (error) throw error;
     res.json(appointments);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ message: error.message, error: error.details });
   }
 });
 
@@ -60,14 +90,20 @@ router.get('/landlord/my-appointments', auth, async (req, res) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const appointments = await Appointment.find({ landlord: req.user._id })
-      .populate('house', 'title location price images')
-      .populate('customer', 'name email phone')
-      .sort({ appointmentDate: -1 });
+    const { data: appointments, error } = await supabase
+      .from('appointments')
+      .select(`
+        *,
+        house:houses(title, location, price, images),
+        customer:users!appointment_customer_id_fkey(name, email, phone)
+      `)
+      .eq('landlord_id', req.user.id)
+      .order('appointment_date', { ascending: false });
 
+    if (error) throw error;
     res.json(appointments);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ message: error.message, error: error.details });
   }
 });
 
@@ -75,83 +111,77 @@ router.get('/landlord/my-appointments', auth, async (req, res) => {
 router.put('/:id/status', auth, async (req, res) => {
   try {
     const { status } = req.body;
-    const appointment = await Appointment.findById(req.params.id);
 
-    if (!appointment) {
-      return res.status(404).json({ message: 'Appointment not found' });
-    }
+    // Verify ownership and existence
+    const { data: appointment, error: fetchError } = await supabase
+      .from('appointments')
+      .select('landlord_id')
+      .eq('id', req.params.id)
+      .single();
 
-    // Only landlord can update status
-    if (appointment.landlord.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not authorized' });
-    }
+    if (fetchError || !appointment) return res.status(404).json({ message: 'Appointment not found' });
+    if (appointment.landlord_id !== req.user.id) return res.status(403).json({ message: 'Not authorized' });
 
-    appointment.status = status;
-    await appointment.save();
-    await appointment.populate('house', 'title location');
-    await appointment.populate('customer', 'name email phone');
-    await appointment.populate('landlord', 'name email phone');
+    const { error: updateError } = await supabase
+      .from('appointments')
+      .update({ status })
+      .eq('id', req.params.id);
 
-    res.json(appointment);
+    if (updateError) throw updateError;
+
+    const { data: updated } = await getFullAppointment(req.params.id);
+    res.json(updated);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ message: error.message, error: error.details });
   }
 });
 
 // Cancel appointment (customer or landlord)
 router.put('/:id/cancel', auth, async (req, res) => {
   try {
-    const appointment = await Appointment.findById(req.params.id);
+    const { data: appointment, error: fetchError } = await supabase
+      .from('appointments')
+      .select('customer_id, landlord_id')
+      .eq('id', req.params.id)
+      .single();
 
-    if (!appointment) {
-      return res.status(404).json({ message: 'Appointment not found' });
-    }
+    if (fetchError || !appointment) return res.status(404).json({ message: 'Appointment not found' });
 
-    // Check if user is the customer or landlord
-    const isCustomer = appointment.customer.toString() === req.user._id.toString();
-    const isLandlord = appointment.landlord.toString() === req.user._id.toString();
+    const isCustomer = appointment.customer_id === req.user.id;
+    const isLandlord = appointment.landlord_id === req.user.id;
 
-    if (!isCustomer && !isLandlord) {
-      return res.status(403).json({ message: 'Not authorized' });
-    }
+    if (!isCustomer && !isLandlord) return res.status(403).json({ message: 'Not authorized' });
 
-    appointment.status = 'cancelled';
-    await appointment.save();
-    await appointment.populate('house', 'title location');
-    await appointment.populate('customer', 'name email phone');
-    await appointment.populate('landlord', 'name email phone');
+    const { error: cancelError } = await supabase
+      .from('appointments')
+      .update({ status: 'cancelled' })
+      .eq('id', req.params.id);
 
-    res.json(appointment);
+    if (cancelError) throw cancelError;
+
+    const { data: updated } = await getFullAppointment(req.params.id);
+    res.json(updated);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ message: error.message, error: error.details });
   }
 });
 
 // Get single appointment
 router.get('/:id', auth, async (req, res) => {
   try {
-    const appointment = await Appointment.findById(req.params.id)
-      .populate('house', 'title location price images')
-      .populate('customer', 'name email phone')
-      .populate('landlord', 'name email phone');
+    const { data: appointment, error } = await getFullAppointment(req.params.id);
 
-    if (!appointment) {
-      return res.status(404).json({ message: 'Appointment not found' });
-    }
+    if (error || !appointment) return res.status(404).json({ message: 'Appointment not found' });
 
-    // Check if user is authorized to view this appointment
-    const isCustomer = appointment.customer._id.toString() === req.user._id.toString();
-    const isLandlord = appointment.landlord._id.toString() === req.user._id.toString();
+    const isCustomer = appointment.customer_id === req.user.id;
+    const isLandlord = appointment.landlord_id === req.user.id;
 
-    if (!isCustomer && !isLandlord) {
-      return res.status(403).json({ message: 'Not authorized' });
-    }
+    if (!isCustomer && !isLandlord) return res.status(403).json({ message: 'Not authorized' });
 
     res.json(appointment);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ message: error.message, error: error.details });
   }
 });
 
 module.exports = router;
-
